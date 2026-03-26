@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"minilsm/util"
 )
 
 const (
@@ -34,29 +36,33 @@ type IndexEntry struct {
 
 // Footer contains metadata about the SSTable
 type Footer struct {
-	IndexOffset int64
-	IndexSize   int64
-	NumEntries  int64
-	MagicNumber uint32
-	Version     uint32
+	IndexOffset       int64
+	IndexSize         int64
+	BloomFilterOffset int64
+	BloomFilterSize   int64
+	NumEntries        int64
+	MagicNumber       uint32
+	Version           uint32
 }
 
 // SSTable represents a sorted string table on disk
 type SSTable struct {
-	path       string
-	file       *os.File
-	indexCache []IndexEntry
-	footer     Footer
+	path        string
+	file        *os.File
+	indexCache  []IndexEntry
+	bloomFilter *util.BloomFilter
+	footer      Footer
 }
 
 // Writer is used to create a new SSTable
 type Writer struct {
-	file         *os.File
-	path         string
-	currentBlock []byte
-	blockOffset  int64
-	index        []IndexEntry
-	numEntries   int64
+	file            *os.File
+	path            string
+	currentBlock    []byte
+	blockOffset     int64
+	index           []IndexEntry
+	bloomFilter     *util.BloomFilter
+	numEntries      int64
 	firstKeyInBlock []byte
 }
 
@@ -74,13 +80,20 @@ func NewWriter(path string) (*Writer, error) {
 		return nil, fmt.Errorf("failed to create file: %w", err)
 	}
 
+	// Create bloom filter with 1% false positive rate
+	// Use a larger initial estimate to handle more entries
+	// The bloom filter will still work correctly even if we exceed this estimate,
+	// but the false positive rate may increase slightly
+	bloomFilter := util.NewBloomFilter(10000, 0.01)
+
 	return &Writer{
-		file:        file,
-		path:        path,
+		file:         file,
+		path:         path,
 		currentBlock: make([]byte, 0, BlockSize),
-		blockOffset: 0,
-		index:       make([]IndexEntry, 0),
-		numEntries:  0,
+		blockOffset:  0,
+		index:        make([]IndexEntry, 0),
+		bloomFilter:  bloomFilter,
+		numEntries:   0,
 	}, nil
 }
 
@@ -90,6 +103,9 @@ func (w *Writer) Add(key, value []byte) error {
 	if len(key) == 0 {
 		return fmt.Errorf("key cannot be empty")
 	}
+
+	// Add key to bloom filter
+	w.bloomFilter.Add(key)
 
 	// Encode entry: [keySize(4)][valueSize(4)][key][value]
 	entrySize := 4 + 4 + len(key) + len(value)
@@ -167,7 +183,7 @@ func (w *Writer) flushBlock() error {
 	return nil
 }
 
-// Finalize completes the SSTable by writing the index and footer
+// Finalize completes the SSTable by writing the index, bloom filter, and footer
 func (w *Writer) Finalize() error {
 	// Flush any remaining data in current block
 	if err := w.flushBlock(); err != nil {
@@ -201,20 +217,36 @@ func (w *Writer) Finalize() error {
 	}
 	indexSize := currentPos - indexOffset
 
+	// Record bloom filter offset
+	bloomFilterOffset := currentPos
+
+	// Write bloom filter
+	bloomFilterData := w.bloomFilter.Serialize()
+	if _, err := w.file.Write(bloomFilterData); err != nil {
+		return fmt.Errorf("failed to write bloom filter: %w", err)
+	}
+	bloomFilterSize := int64(len(bloomFilterData))
+
 	// Write footer
 	footer := Footer{
-		IndexOffset: indexOffset,
-		IndexSize:   indexSize,
-		NumEntries:  w.numEntries,
-		MagicNumber: MagicNumber,
-		Version:     Version,
+		IndexOffset:       indexOffset,
+		IndexSize:         indexSize,
+		BloomFilterOffset: bloomFilterOffset,
+		BloomFilterSize:   bloomFilterSize,
+		NumEntries:        w.numEntries,
+		MagicNumber:       MagicNumber,
+		Version:           Version,
 	}
 
-	footerBytes := make([]byte, 32) // 8+8+8+4+4 = 32 bytes
+	footerBytes := make([]byte, 48) // 8+8+8+8+8+4+4 = 48 bytes
 	offset := 0
 	binary.BigEndian.PutUint64(footerBytes[offset:], uint64(footer.IndexOffset))
 	offset += 8
 	binary.BigEndian.PutUint64(footerBytes[offset:], uint64(footer.IndexSize))
+	offset += 8
+	binary.BigEndian.PutUint64(footerBytes[offset:], uint64(footer.BloomFilterOffset))
+	offset += 8
+	binary.BigEndian.PutUint64(footerBytes[offset:], uint64(footer.BloomFilterSize))
 	offset += 8
 	binary.BigEndian.PutUint64(footerBytes[offset:], uint64(footer.NumEntries))
 	offset += 8
@@ -254,25 +286,59 @@ func Open(path string) (*SSTable, error) {
 		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 
-	// Read footer (last 32 bytes)
-	if _, err := file.Seek(-32, io.SeekEnd); err != nil {
+	// Try to read new format footer (48 bytes) first
+	var footer Footer
+	var isOldFormat bool
+
+	if _, err := file.Seek(-48, io.SeekEnd); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("failed to seek to footer: %w", err)
 	}
 
-	footerBytes := make([]byte, 32)
+	footerBytes := make([]byte, 48)
 	if _, err := io.ReadFull(file, footerBytes); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("failed to read footer: %w", err)
 	}
 
-	// Parse footer
-	footer := Footer{
-		IndexOffset: int64(binary.BigEndian.Uint64(footerBytes[0:8])),
-		IndexSize:   int64(binary.BigEndian.Uint64(footerBytes[8:16])),
-		NumEntries:  int64(binary.BigEndian.Uint64(footerBytes[16:24])),
-		MagicNumber: binary.BigEndian.Uint32(footerBytes[24:28]),
-		Version:     binary.BigEndian.Uint32(footerBytes[28:32]),
+	// Check if this is the new format by verifying magic number at position 40
+	magicNumber := binary.BigEndian.Uint32(footerBytes[40:44])
+	
+	if magicNumber == MagicNumber {
+		// New format (48 bytes)
+		footer = Footer{
+			IndexOffset:       int64(binary.BigEndian.Uint64(footerBytes[0:8])),
+			IndexSize:         int64(binary.BigEndian.Uint64(footerBytes[8:16])),
+			BloomFilterOffset: int64(binary.BigEndian.Uint64(footerBytes[16:24])),
+			BloomFilterSize:   int64(binary.BigEndian.Uint64(footerBytes[24:32])),
+			NumEntries:        int64(binary.BigEndian.Uint64(footerBytes[32:40])),
+			MagicNumber:       magicNumber,
+			Version:           binary.BigEndian.Uint32(footerBytes[44:48]),
+		}
+		isOldFormat = false
+	} else {
+		// Try old format (32 bytes)
+		if _, err := file.Seek(-32, io.SeekEnd); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to seek to old footer: %w", err)
+		}
+
+		oldFooterBytes := make([]byte, 32)
+		if _, err := io.ReadFull(file, oldFooterBytes); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to read old footer: %w", err)
+		}
+
+		footer = Footer{
+			IndexOffset:       int64(binary.BigEndian.Uint64(oldFooterBytes[0:8])),
+			IndexSize:         int64(binary.BigEndian.Uint64(oldFooterBytes[8:16])),
+			BloomFilterOffset: 0,
+			BloomFilterSize:   0,
+			NumEntries:        int64(binary.BigEndian.Uint64(oldFooterBytes[16:24])),
+			MagicNumber:       binary.BigEndian.Uint32(oldFooterBytes[24:28]),
+			Version:           binary.BigEndian.Uint32(oldFooterBytes[28:32]),
+		}
+		isOldFormat = true
 	}
 
 	// Verify magic number
@@ -327,16 +393,44 @@ func Open(path string) (*SSTable, error) {
 		})
 	}
 
+	// Read bloom filter (only for new format)
+	var bloomFilter *util.BloomFilter
+	if !isOldFormat && footer.BloomFilterSize > 0 {
+		if _, err := file.Seek(footer.BloomFilterOffset, io.SeekStart); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to seek to bloom filter: %w", err)
+		}
+
+		bloomFilterData := make([]byte, footer.BloomFilterSize)
+		if _, err := io.ReadFull(file, bloomFilterData); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to read bloom filter: %w", err)
+		}
+
+		bloomFilter, err = util.DeserializeBloomFilter(bloomFilterData)
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to deserialize bloom filter: %w", err)
+		}
+	}
+
 	return &SSTable{
-		path:       path,
-		file:       file,
-		indexCache: index,
-		footer:     footer,
+		path:        path,
+		file:        file,
+		indexCache:  index,
+		bloomFilter: bloomFilter,
+		footer:      footer,
 	}, nil
 }
 
 // Get retrieves a value by key from the SSTable
 func (s *SSTable) Get(key []byte) ([]byte, bool, error) {
+	// Check bloom filter first (if available)
+	if s.bloomFilter != nil && !s.bloomFilter.MayContain(key) {
+		// Key definitely not in this SSTable
+		return nil, false, nil
+	}
+
 	// Binary search in index to find the block
 	blockIdx := s.findBlock(key)
 	if blockIdx < 0 {
