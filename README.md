@@ -4,7 +4,7 @@ A from-scratch implementation of an LSM-tree (Log-Structured Merge-Tree) databas
 
 ## Project Status
 
-### Phase 1: Foundation (In Progress)
+### Phase 1: Foundation 
 
 #### 1.1 Write-Ahead Log (WAL) - COMPLETED
 
