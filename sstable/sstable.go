@@ -19,7 +19,7 @@ const (
 	MagicNumber = 0x5354424C // "STBL" in hex
 
 	// Version of the SSTable format
-	Version = 1
+	Version = 2 // Incremented to support compression
 )
 
 // Entry represents a key-value pair in the SSTable
@@ -41,6 +41,7 @@ type Footer struct {
 	BloomFilterOffset int64
 	BloomFilterSize   int64
 	NumEntries        int64
+	CompressionType   util.CompressionType
 	MagicNumber       uint32
 	Version           uint32
 }
@@ -54,6 +55,11 @@ type SSTable struct {
 	footer      Footer
 }
 
+// WriterOptions contains configuration options for SSTable writer
+type WriterOptions struct {
+	Compression util.CompressionType
+}
+
 // Writer is used to create a new SSTable
 type Writer struct {
 	file            *os.File
@@ -64,10 +70,18 @@ type Writer struct {
 	bloomFilter     *util.BloomFilter
 	numEntries      int64
 	firstKeyInBlock []byte
+	compression     util.CompressionType
 }
 
-// NewWriter creates a new SSTable writer
+// NewWriter creates a new SSTable writer with default options (no compression)
 func NewWriter(path string) (*Writer, error) {
+	return NewWriterWithOptions(path, WriterOptions{
+		Compression: util.NoCompression,
+	})
+}
+
+// NewWriterWithOptions creates a new SSTable writer with custom options
+func NewWriterWithOptions(path string, opts WriterOptions) (*Writer, error) {
 	// Create parent directory if needed
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -94,6 +108,7 @@ func NewWriter(path string) (*Writer, error) {
 		index:        make([]IndexEntry, 0),
 		bloomFilter:  bloomFilter,
 		numEntries:   0,
+		compression:  opts.Compression,
 	}, nil
 }
 
@@ -146,14 +161,47 @@ func (w *Writer) flushBlock() error {
 		return nil
 	}
 
-	// Pad block to BlockSize
+	// Store original size before padding
+	originalSize := len(w.currentBlock)
+
+	// Pad block to BlockSize before compression
 	if len(w.currentBlock) < BlockSize {
 		padding := make([]byte, BlockSize-len(w.currentBlock))
 		w.currentBlock = append(w.currentBlock, padding...)
 	}
 
-	// Calculate CRC32 for the block
-	crc := crc32.ChecksumIEEE(w.currentBlock)
+	// Compress block if compression is enabled
+	blockData := w.currentBlock
+	if w.compression != util.NoCompression {
+		compressed, err := util.Compress(w.currentBlock, w.compression)
+		if err != nil {
+			return fmt.Errorf("failed to compress block: %w", err)
+		}
+		blockData = compressed
+	}
+
+	// Write compression type (1 byte)
+	compressionByte := []byte{byte(w.compression)}
+	if _, err := w.file.Write(compressionByte); err != nil {
+		return fmt.Errorf("failed to write compression type: %w", err)
+	}
+
+	// Write original size (4 bytes) - needed for decompression
+	sizeBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(sizeBytes, uint32(originalSize))
+	if _, err := w.file.Write(sizeBytes); err != nil {
+		return fmt.Errorf("failed to write original size: %w", err)
+	}
+
+	// Write compressed size (4 bytes)
+	compressedSizeBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(compressedSizeBytes, uint32(len(blockData)))
+	if _, err := w.file.Write(compressedSizeBytes); err != nil {
+		return fmt.Errorf("failed to write compressed size: %w", err)
+	}
+
+	// Calculate CRC32 for the compressed block data
+	crc := crc32.ChecksumIEEE(blockData)
 
 	// Write CRC32 (4 bytes)
 	crcBytes := make([]byte, 4)
@@ -162,8 +210,8 @@ func (w *Writer) flushBlock() error {
 		return fmt.Errorf("failed to write CRC: %w", err)
 	}
 
-	// Write block
-	if _, err := w.file.Write(w.currentBlock); err != nil {
+	// Write block data (compressed or uncompressed)
+	if _, err := w.file.Write(blockData); err != nil {
 		return fmt.Errorf("failed to write block: %w", err)
 	}
 
@@ -173,8 +221,8 @@ func (w *Writer) flushBlock() error {
 		Offset: w.blockOffset,
 	})
 
-	// Update offset (CRC + block)
-	w.blockOffset += 4 + int64(len(w.currentBlock))
+	// Update offset (compression type + original size + compressed size + CRC + block data)
+	w.blockOffset += 1 + 4 + 4 + 4 + int64(len(blockData))
 
 	// Reset current block
 	w.currentBlock = w.currentBlock[:0]
@@ -234,11 +282,12 @@ func (w *Writer) Finalize() error {
 		BloomFilterOffset: bloomFilterOffset,
 		BloomFilterSize:   bloomFilterSize,
 		NumEntries:        w.numEntries,
+		CompressionType:   w.compression,
 		MagicNumber:       MagicNumber,
 		Version:           Version,
 	}
 
-	footerBytes := make([]byte, 48) // 8+8+8+8+8+4+4 = 48 bytes
+	footerBytes := make([]byte, 49) // 8+8+8+8+8+1+4+4 = 49 bytes
 	offset := 0
 	binary.BigEndian.PutUint64(footerBytes[offset:], uint64(footer.IndexOffset))
 	offset += 8
@@ -250,6 +299,8 @@ func (w *Writer) Finalize() error {
 	offset += 8
 	binary.BigEndian.PutUint64(footerBytes[offset:], uint64(footer.NumEntries))
 	offset += 8
+	footerBytes[offset] = byte(footer.CompressionType)
+	offset += 1
 	binary.BigEndian.PutUint32(footerBytes[offset:], footer.MagicNumber)
 	offset += 4
 	binary.BigEndian.PutUint32(footerBytes[offset:], footer.Version)
@@ -286,38 +337,39 @@ func Open(path string) (*SSTable, error) {
 		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 
-	// Try to read new format footer (48 bytes) first
+	// Try to read new format footer (49 bytes for v2) first
 	var footer Footer
 	var isOldFormat bool
 
-	if _, err := file.Seek(-48, io.SeekEnd); err != nil {
+	if _, err := file.Seek(-49, io.SeekEnd); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("failed to seek to footer: %w", err)
 	}
 
-	footerBytes := make([]byte, 48)
+	footerBytes := make([]byte, 49)
 	if _, err := io.ReadFull(file, footerBytes); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("failed to read footer: %w", err)
 	}
 
-	// Check if this is the new format by verifying magic number at position 40
-	magicNumber := binary.BigEndian.Uint32(footerBytes[40:44])
+	// Check if this is version 2 format by verifying magic number at position 41
+	magicNumber := binary.BigEndian.Uint32(footerBytes[41:45])
 	
 	if magicNumber == MagicNumber {
-		// New format (48 bytes)
+		// Version 2 format (49 bytes) with compression support
 		footer = Footer{
 			IndexOffset:       int64(binary.BigEndian.Uint64(footerBytes[0:8])),
 			IndexSize:         int64(binary.BigEndian.Uint64(footerBytes[8:16])),
 			BloomFilterOffset: int64(binary.BigEndian.Uint64(footerBytes[16:24])),
 			BloomFilterSize:   int64(binary.BigEndian.Uint64(footerBytes[24:32])),
 			NumEntries:        int64(binary.BigEndian.Uint64(footerBytes[32:40])),
+			CompressionType:   util.CompressionType(footerBytes[40]),
 			MagicNumber:       magicNumber,
-			Version:           binary.BigEndian.Uint32(footerBytes[44:48]),
+			Version:           binary.BigEndian.Uint32(footerBytes[45:49]),
 		}
 		isOldFormat = false
 	} else {
-		// Try old format (32 bytes)
+		// Try version 1 format (32 bytes)
 		if _, err := file.Seek(-32, io.SeekEnd); err != nil {
 			file.Close()
 			return nil, fmt.Errorf("failed to seek to old footer: %w", err)
@@ -335,6 +387,7 @@ func Open(path string) (*SSTable, error) {
 			BloomFilterOffset: 0,
 			BloomFilterSize:   0,
 			NumEntries:        int64(binary.BigEndian.Uint64(oldFooterBytes[16:24])),
+			CompressionType:   util.NoCompression,
 			MagicNumber:       binary.BigEndian.Uint32(oldFooterBytes[24:28]),
 			Version:           binary.BigEndian.Uint32(oldFooterBytes[28:32]),
 		}
@@ -347,10 +400,10 @@ func Open(path string) (*SSTable, error) {
 		return nil, fmt.Errorf("invalid magic number: expected %x, got %x", MagicNumber, footer.MagicNumber)
 	}
 
-	// Verify version
-	if footer.Version != Version {
+	// Support both version 1 and version 2
+	if footer.Version > Version {
 		file.Close()
-		return nil, fmt.Errorf("unsupported version: %d", footer.Version)
+		return nil, fmt.Errorf("unsupported version: %d (current version: %d)", footer.Version, Version)
 	}
 
 	// Read index
@@ -475,6 +528,79 @@ func (s *SSTable) readBlock(offset int64) ([]byte, error) {
 		return nil, fmt.Errorf("failed to seek to block: %w", err)
 	}
 
+	// Check if this is a new format (version 2) with compression support
+	if s.footer.Version >= 2 {
+		return s.readCompressedBlock()
+	}
+
+	// Legacy format (version 1) - uncompressed
+	return s.readLegacyBlock()
+}
+
+// readCompressedBlock reads a block with compression support (version 2+)
+func (s *SSTable) readCompressedBlock() ([]byte, error) {
+	// Read compression type (1 byte)
+	compressionByte := make([]byte, 1)
+	if _, err := io.ReadFull(s.file, compressionByte); err != nil {
+		return nil, fmt.Errorf("failed to read compression type: %w", err)
+	}
+	compressionType := util.CompressionType(compressionByte[0])
+
+	// Read original size (4 bytes)
+	originalSizeBytes := make([]byte, 4)
+	if _, err := io.ReadFull(s.file, originalSizeBytes); err != nil {
+		return nil, fmt.Errorf("failed to read original size: %w", err)
+	}
+	originalSize := binary.BigEndian.Uint32(originalSizeBytes)
+
+	// Read compressed size (4 bytes)
+	compressedSizeBytes := make([]byte, 4)
+	if _, err := io.ReadFull(s.file, compressedSizeBytes); err != nil {
+		return nil, fmt.Errorf("failed to read compressed size: %w", err)
+	}
+	compressedSize := binary.BigEndian.Uint32(compressedSizeBytes)
+
+	// Read CRC32 (4 bytes)
+	crcBytes := make([]byte, 4)
+	if _, err := io.ReadFull(s.file, crcBytes); err != nil {
+		return nil, fmt.Errorf("failed to read CRC: %w", err)
+	}
+	expectedCRC := binary.BigEndian.Uint32(crcBytes)
+
+	// Read compressed block data
+	compressedData := make([]byte, compressedSize)
+	if _, err := io.ReadFull(s.file, compressedData); err != nil {
+		return nil, fmt.Errorf("failed to read compressed block: %w", err)
+	}
+
+	// Verify CRC32 on compressed data
+	actualCRC := crc32.ChecksumIEEE(compressedData)
+	if actualCRC != expectedCRC {
+		return nil, fmt.Errorf("CRC mismatch: expected %d, got %d", expectedCRC, actualCRC)
+	}
+
+	// Decompress if needed
+	var block []byte
+	var err error
+	if compressionType != util.NoCompression {
+		block, err = util.Decompress(compressedData, compressionType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress block: %w", err)
+		}
+	} else {
+		block = compressedData
+	}
+
+	// Verify decompressed size matches original size (only check actual data, not padding)
+	if uint32(len(block)) < originalSize {
+		return nil, fmt.Errorf("decompressed size mismatch: expected at least %d, got %d", originalSize, len(block))
+	}
+
+	return block, nil
+}
+
+// readLegacyBlock reads an uncompressed block (version 1)
+func (s *SSTable) readLegacyBlock() ([]byte, error) {
 	// Read CRC32
 	crcBytes := make([]byte, 4)
 	if _, err := io.ReadFull(s.file, crcBytes); err != nil {
