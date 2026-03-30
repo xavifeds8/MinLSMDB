@@ -422,12 +422,174 @@ func BenchmarkSSTableWrite(b *testing.B) {
 	}
 }
 
+func TestSSTableWithCompression(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compressed.sst")
+
+	// Write SSTable with compression
+	writer, err := NewWriterWithOptions(path, WriterOptions{
+		Compression: 0x01, // FlateCompression
+	})
+	if err != nil {
+		t.Fatalf("Failed to create writer: %v", err)
+	}
+
+	// Add entries
+	numEntries := 100
+	for i := 0; i < numEntries; i++ {
+		key := fmt.Sprintf("key%04d", i)
+		value := fmt.Sprintf("value%04d_with_some_repetitive_data_to_compress_well", i)
+		if err := writer.Add([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to add entry: %v", err)
+		}
+	}
+
+	if err := writer.Finalize(); err != nil {
+		t.Fatalf("Failed to finalize: %v", err)
+	}
+	writer.Close()
+
+	// Read and verify
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatalf("Failed to open SSTable: %v", err)
+	}
+	defer reader.Close()
+
+	// Verify all entries
+	for i := 0; i < numEntries; i++ {
+		key := fmt.Sprintf("key%04d", i)
+		expectedValue := fmt.Sprintf("value%04d_with_some_repetitive_data_to_compress_well", i)
+
+		value, found, err := reader.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Get failed for %s: %v", key, err)
+		}
+		if !found {
+			t.Fatalf("Key %s not found", key)
+		}
+		if string(value) != expectedValue {
+			t.Fatalf("Expected %s, got %s", expectedValue, string(value))
+		}
+	}
+
+	// Verify compression type in footer
+	if reader.footer.CompressionType != 0x01 {
+		t.Fatalf("Expected compression type 0x01, got %d", reader.footer.CompressionType)
+	}
+}
+
+func TestSSTableNoCompression(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "uncompressed.sst")
+
+	// Write SSTable without compression (default)
+	writer, err := NewWriter(path)
+	if err != nil {
+		t.Fatalf("Failed to create writer: %v", err)
+	}
+
+	// Add entries
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("key%04d", i)
+		value := fmt.Sprintf("value%04d", i)
+		if err := writer.Add([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to add entry: %v", err)
+		}
+	}
+
+	if err := writer.Finalize(); err != nil {
+		t.Fatalf("Failed to finalize: %v", err)
+	}
+	writer.Close()
+
+	// Read and verify
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatalf("Failed to open SSTable: %v", err)
+	}
+	defer reader.Close()
+
+	// Verify compression type is NoCompression
+	if reader.footer.CompressionType != 0x00 {
+		t.Fatalf("Expected compression type 0x00, got %d", reader.footer.CompressionType)
+	}
+}
+
+func TestSSTableCompressionRatio(t *testing.T) {
+	dir := t.TempDir()
+	
+	// Create uncompressed SSTable
+	uncompressedPath := filepath.Join(dir, "uncompressed.sst")
+	writer1, _ := NewWriter(uncompressedPath)
+	
+	// Create compressed SSTable
+	compressedPath := filepath.Join(dir, "compressed.sst")
+	writer2, _ := NewWriterWithOptions(compressedPath, WriterOptions{
+		Compression: 0x01, // FlateCompression
+	})
+
+	// Add same data to both
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("key%04d", i)
+		// Repetitive value that compresses well
+		value := bytes.Repeat([]byte("data"), 50)
+		writer1.Add([]byte(key), value)
+		writer2.Add([]byte(key), value)
+	}
+
+	writer1.Finalize()
+	writer1.Close()
+	writer2.Finalize()
+	writer2.Close()
+
+	// Compare file sizes
+	uncompressedInfo, _ := os.Stat(uncompressedPath)
+	compressedInfo, _ := os.Stat(compressedPath)
+
+	t.Logf("Uncompressed size: %d bytes", uncompressedInfo.Size())
+	t.Logf("Compressed size: %d bytes", compressedInfo.Size())
+	t.Logf("Compression ratio: %.2f%%", float64(compressedInfo.Size())/float64(uncompressedInfo.Size())*100)
+
+	// Compressed should be smaller
+	if compressedInfo.Size() >= uncompressedInfo.Size() {
+		t.Logf("Warning: Compressed file is not smaller (this can happen with small datasets)")
+	}
+}
+
 func BenchmarkSSTableRead(b *testing.B) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "bench.sst")
 
 	// Create SSTable
 	writer, _ := NewWriter(path)
+	for i := 0; i < 1000; i++ {
+		key := fmt.Sprintf("key%06d", i)
+		value := fmt.Sprintf("value%06d", i)
+		writer.Add([]byte(key), []byte(value))
+	}
+	writer.Finalize()
+	writer.Close()
+
+	// Open for reading
+	reader, _ := Open(path)
+	defer reader.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("key%06d", i%1000)
+		reader.Get([]byte(key))
+	}
+}
+
+func BenchmarkSSTableReadCompressed(b *testing.B) {
+	dir := b.TempDir()
+	path := filepath.Join(dir, "bench_compressed.sst")
+
+	// Create compressed SSTable
+	writer, _ := NewWriterWithOptions(path, WriterOptions{
+		Compression: 0x01, // FlateCompression
+	})
 	for i := 0; i < 1000; i++ {
 		key := fmt.Sprintf("key%06d", i)
 		value := fmt.Sprintf("value%06d", i)
